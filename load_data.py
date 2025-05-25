@@ -3,15 +3,17 @@ import asyncpg
 import os
 import logging
 import pandas as pd
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
 from collections import deque
 from typing import Union, Optional, Any, List, Dict
 from features.logging import setup_logger
 from preprocessing import main_preprocessing
 import numpy as np
 import json
-
 import joblib
+
+UTC = timezone.utc  # Создаем алиас для совместимости
+
 logger = setup_logger()
 
 DB_DSN = os.getenv('DB_DSN', 'postgresql://student:5SxdeChZ@emcable.teledesk.ru:15432/mscada_db')
@@ -114,7 +116,7 @@ class DataCollector:
             while self.collecting:
                 data = await self.db.fetch_multiple_tags(DATA_TAGS, timestamp)
                 timestamped = {
-                    'collected_at': datetime.now(datetime.UTC).isoformat(),
+                    'collected_at': datetime.now(UTC).isoformat(),
                     'data': data
                 }
                 await self.queue.put(timestamped)
@@ -282,7 +284,7 @@ async def model_worker(queue: asyncio.Queue):
 
                 # Конвертация времени из Windows FILETIME
                 chunk_df['timestamp'] = chunk_df['timestamp'].apply(
-                    lambda x: datetime.fromtimestamp((x / 10 ** 7) - 11644473600, datetime.UTC)
+                    lambda x: datetime.fromtimestamp((x / 10 ** 7) - 11644473600, tz=UTC)
                 )
                 chunk_df['timestamp'] = pd.to_datetime(chunk_df['timestamp'])
 
