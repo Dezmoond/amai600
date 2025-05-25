@@ -268,8 +268,8 @@ class DataBuffer:
         return pd.DataFrame(self.buffer)
 
 
-model = joblib.load('D:/anaconda3/envs/amai1/amai1/random_forestFULLDATASET11sd102min.pkl')
-scaler = joblib.load('D:/anaconda3\envs/amai1/amai1/scalerFULLDATASET11sd102min.pkl')
+model = joblib.load('random_forestFULLDATASET11sd102min.pkl')
+scaler = joblib.load('scalerFULLDATASET11sd102min.pkl')
 
 
 async def model_worker(queue: asyncio.Queue):
