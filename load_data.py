@@ -147,19 +147,19 @@ class PredictionLogger:
         ch.setFormatter(formatter)
         self.logger.addHandler(ch)
 
-    def add_prediction(self, timestamp, lead_time, confidence):
+    def add_prediction(self, timestamp, lead_time, confidence, emergency_detected=False):
         prediction = {
             'timestamp': timestamp,
             'predicted_time': timestamp + timedelta(seconds=lead_time),
             'lead_time': lead_time,
             'confidence': confidence,
+            'emergency_detected': emergency_detected,
             'confirmed': None
         }
         self.predictions.append(prediction)
         self.logger.info(
-            f"ПРЕДСКАЗАНИЕ: Авария через {lead_time} сек "
-            f"(в {prediction['predicted_time'].strftime('%H:%M:%S')}, "
-            f"уверенность {confidence:.1%})"
+            f"ПРЕДСКАЗАНИЕ: {'🚨 Авария' if emergency_detected else 'Нет аварии'} через {lead_time} сек "
+            f"(в {prediction['predicted_time'].strftime('%H:%M:%S')}, уверенность {confidence:.1%})"
         )
 
     def check_predictions(self, event_time):
@@ -361,6 +361,7 @@ async def model_worker(queue: asyncio.Queue):
                     prediction_probas = model.predict_proba(scaled)
 
                     # === Логирование предсказаний ===
+                    emergency_detected = False
                     for i, (pred, proba) in enumerate(zip(predictions, prediction_probas)):
                         if pred == 1:  # Только аварийные предсказания
                             lead_time = 10 - i  # 10, 9, ..., 1 секунд
@@ -369,14 +370,13 @@ async def model_worker(queue: asyncio.Queue):
                             prediction_logger.add_prediction(
                                 timestamp=current_time,
                                 lead_time=lead_time,
-                                confidence=confidence
-                            )
-                        prediction_logger.save_history(ALL_PREDICTIONS_FILE)
+                                confidence=confidence,
+                                emergency_detected=True)
+                    # Сохраняем только если была хоть одна авария
+                    if emergency_detected:
+                            prediction_logger.save_history(ALL_PREDICTIONS_FILE)
                     # === Проверка на аварийные события ===
-                    is_emergency = (
-                            processed_df['value_600'].iloc[-1] == 1 or
-                            processed_df['value_601'].iloc[-1] == 1
-                    )
+                    is_emergency = True
 
                     if is_emergency:
                         logger.warning(f"!!! АВАРИЯ ОБНАРУЖЕНА В {current_time.strftime('%H:%M:%S')} !!!")
@@ -486,7 +486,6 @@ async def main():
     logger.info("Запуск потоков для обработки данных")
     workers = [asyncio.create_task(model_worker(collector.queue))]
     #workers = [asyncio.create_task(model_worker(collector.queue)) for _ in range(2)]
-
     # запуск потоков
     await asyncio.gather(*workers)
 logger = setup_logger()
