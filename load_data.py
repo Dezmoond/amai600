@@ -484,8 +484,8 @@ async def main():
 
     # Подготовка 2х потоков для обработки данных
     logger.info("Запуск потоков для обработки данных")
-    #workers = [asyncio.create_task(model_worker(collector.queue))]
-    workers = [asyncio.create_task(model_worker(collector.queue)) for _ in range(2)]
+    workers = [asyncio.create_task(model_worker(collector.queue))]
+    #workers = [asyncio.create_task(model_worker(collector.queue)) for _ in range(2)]
     # запуск потоков
     await asyncio.gather(*workers)
 logger = setup_logger()
