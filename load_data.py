@@ -3,7 +3,7 @@ import asyncpg
 import os
 import logging
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from collections import deque
 from typing import Union, Optional, Any, List, Dict
 from features.logging import setup_logger
@@ -113,8 +113,8 @@ class DataCollector:
         try:
             while self.collecting:
                 data = await self.db.fetch_multiple_tags(DATA_TAGS, timestamp)
-                timestamped = {
-                    'collected_at': datetime.utcnow().isoformat(),
+                'timestamped': {
+                    'collected_at': datetime.now(datetime.UTC).isoformat(),
                     'data': data
                 }
                 await self.queue.put(timestamped)
@@ -282,7 +282,7 @@ async def model_worker(queue: asyncio.Queue):
 
                 # Конвертация времени из Windows FILETIME
                 chunk_df['timestamp'] = chunk_df['timestamp'].apply(
-                    lambda x: datetime.utcfromtimestamp((x / 10 ** 7) - 11644473600)
+                    lambda x: datetime.fromtimestamp((x / 10 ** 7) - 11644473600, datetime.UTC)
                 )
                 chunk_df['timestamp'] = pd.to_datetime(chunk_df['timestamp'])
 
