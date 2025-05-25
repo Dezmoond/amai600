@@ -209,12 +209,28 @@ class PredictionLogger:
 
         self.logger.info("===============================\n")
 
-    def save_history(self, filename):
+    def save_history(self, filename, mode='a'):
         try:
+            # Читаем существующие данные, если файл есть
+            existing_data = []
+            if os.path.exists(filename):
+                with open(filename, 'r', encoding='utf-8') as f:
+                    try:
+                        existing_data = json.load(f)
+                    except json.JSONDecodeError:
+                        existing_data = []
+
+            # Добавляем новые предсказания
+            if isinstance(existing_data, list):
+                existing_data.extend(self.predictions)
+            else:
+                existing_data = self.predictions
+
+            # Записываем обновленные данные
             with open(filename, 'w', encoding='utf-8') as f:
-                history = list(self.predictions)
-                json.dump(history, f, indent=2, default=str, ensure_ascii=False)
-            self.logger.info(f"История сохранена в {filename}")
+                json.dump(existing_data, f, indent=2, default=str, ensure_ascii=False)
+
+            self.logger.info(f"История дополнена в {filename}")
         except Exception as e:
             self.logger.error(f"Ошибка сохранения: {str(e)}")
 
@@ -252,8 +268,8 @@ class DataBuffer:
         return pd.DataFrame(self.buffer)
 
 
-model = joblib.load('random_forestFULLDATASET11sd102min.pkl')
-scaler = joblib.load('scalerFULLDATASET11sd102min.pkl')
+model = joblib.load('D:/anaconda3/envs/amai1/amai1/random_forestFULLDATASET11sd102min.pkl')
+scaler = joblib.load('D:/anaconda3\envs/amai1/amai1/scalerFULLDATASET11sd102min.pkl')
 
 
 async def model_worker(queue: asyncio.Queue):
@@ -265,7 +281,7 @@ async def model_worker(queue: asyncio.Queue):
     NUMERIC_TAGS = [34, 565, 566, 567, 568, 569, 570, 571, 603, 604]
     CLASS_TAGS = {600: 0, 601: 0, 602: 1}
     ALL_TAGS = NUMERIC_TAGS + list(CLASS_TAGS.keys())
-
+    ALL_PREDICTIONS_FILE = 'all_predictions.json'
     try:
         while True:
             item = await queue.get()
@@ -355,7 +371,7 @@ async def model_worker(queue: asyncio.Queue):
                                 lead_time=lead_time,
                                 confidence=confidence
                             )
-
+                        prediction_logger.save_history(ALL_PREDICTIONS_FILE)
                     # === Проверка на аварийные события ===
                     is_emergency = (
                             processed_df['value_600'].iloc[-1] == 1 or
