@@ -81,12 +81,15 @@ class PostgresClient:
             
             return data_dict
 
+
 class DataCollector:
     def __init__(self, db: PostgresClient):
         self.db = db
         self.collecting = False
         self.queue: asyncio.Queue = asyncio.Queue()
         self._collector_task: Optional[asyncio.Task] = None
+        self.current_session = None
+        self.sessions = []
 
     async def start(self):
         await self.db.connect()
@@ -97,19 +100,57 @@ class DataCollector:
         start_ts = 0
         while True:
             val, timestamp = await self.db.fetch_tag_value(CONTROL_TAG)
-            logger.info(f"ЗНАЧЕНИЕ ТЕГА 602: {val}, timestamp: {timestamp} ({datetime.fromtimestamp((timestamp/10000000)-11644473600)})")
+            logger.info(
+                f"ЗНАЧЕНИЕ ТЕГА 602: {val}, timestamp: {timestamp} ({datetime.fromtimestamp((timestamp / 10000000) - 11644473600)})")
             start_ts = timestamp
             if val == 1 and not self.collecting:
                 self.collecting = True
                 logger.info(f"НАЧАЛО СБОРА ДАННЫХ: timestamp: {timestamp}, start_ts: {start_ts}")
-                
+                # Начало новой сессии
+                self.current_session = {
+                    "start_time": datetime.now(UTC).isoformat(),
+                    "end_time": None,
+                    "real_emergencies": 0,
+                    "predicted_emergencies": 0
+                }
                 self._collector_task = asyncio.create_task(self._collect_loop(start_ts))
             elif val == 0 and self.collecting:
                 self.collecting = False
                 logger.info(f"ЗАВЕРШЕНИЕ СБОРА ДАННЫХ: timestamp: {timestamp}, start_ts: {start_ts}")
+                # Завершение сессии
+                if self.current_session:
+                    self.current_session["end_time"] = datetime.now(UTC).isoformat()
+                    self.sessions.append(self.current_session)
+                    self._save_sessions()
+                    self.current_session = None
                 if self._collector_task:
                     self._collector_task.cancel()
             await asyncio.sleep(1)
+
+    def _save_sessions(self):
+        try:
+            filename = "Session_logs.json"
+            existing = []
+            if os.path.exists(filename):
+                with open(filename, "r") as f:
+                    existing = json.load(f)
+
+            all_sessions = existing + self.sessions
+            with open(filename, "w") as f:
+                json.dump(all_sessions, f, indent=2, default=str)
+
+            self.sessions = []
+            logger.info(f"Сохранена сессия в {filename}")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения сессий: {str(e)}")
+
+    def add_real_emergency(self):
+        if self.current_session:
+            self.current_session["real_emergencies"] += 1
+
+    def add_predicted_emergency(self):
+        if self.current_session:
+            self.current_session["predicted_emergencies"] += 1
 
     async def _collect_loop(self, timestamp: str):
         try:
@@ -133,6 +174,7 @@ class DataCollector:
 class PredictionLogger:
     def __init__(self):
         self.predictions = []
+        self.history = []
         self.confirmed_predictions = []
         self.false_predictions = []
         self.logger = logging.getLogger('PredictionLogger')
@@ -147,39 +189,61 @@ class PredictionLogger:
         ch.setFormatter(formatter)
         self.logger.addHandler(ch)
 
-    def add_prediction(self, timestamp, lead_time, confidence, emergency_detected=False):
-        prediction = {
-            'timestamp': timestamp,
-            'predicted_time': timestamp + timedelta(seconds=lead_time),
-            'lead_time': lead_time,
-            'confidence': confidence,
-            'emergency_detected': emergency_detected,
-            'confirmed': None
+    def add_prediction(self, timestamp, lead_time, confidence, emergency_detected):
+        prediction_record = {
+            'timestamp': timestamp.isoformat(),
+            'lead_time_sec': lead_time,
+            'confidence': round(confidence, 4),
+            'is_emergency_predicted': emergency_detected,
+            'is_emergency_actual': None,
+            'predicted_time': (timestamp + pd.Timedelta(seconds=lead_time)).strftime('%H:%M:%S'),
+            'is_confirmed': None  # Добавляем поле
         }
-        self.predictions.append(prediction)
+
+        # Добавляем в оба списка (history и predictions)
+        self.history.append(prediction_record)
+        self.predictions.append(prediction_record)  # Если действительно нужно дублирование
+
+        # Логируем информацию
         self.logger.info(
-            f"ПРЕДСКАЗАНИЕ: {'🚨 Авария' if emergency_detected else 'Нет аварии'} через {lead_time} сек "
-            f"(в {prediction['predicted_time'].strftime('%H:%M:%S')}, уверенность {confidence:.1%})"
+            f"ПРЕДСКАЗАНИЕ: {'🚨 Авария' if emergency_detected else 'Нет аварии'} "
+            f"через {lead_time} сек "
+            f"(в {prediction_record['predicted_time']}, "
+            f"уверенность {confidence:.1%})"
         )
 
     def check_predictions(self, event_time):
         for pred in self.predictions:
-            if pred['confirmed'] is None:
-                time_diff = (event_time - pred['predicted_time']).total_seconds()
-                if abs(time_diff) <= 2:
-                    pred['confirmed'] = True
-                    self.confirmed_predictions.append(pred)
-                    self.logger.warning(
-                        f"✅ ПОДТВЕРЖДЕНО: Предсказание за {pred['lead_time']} сек до события "
-                        f"(объявлено в {pred['timestamp'].strftime('%H:%M:%S')})"
-                    )
-                elif event_time > pred['predicted_time']:
-                    pred['confirmed'] = False
-                    self.false_predictions.append(pred)
-                    self.logger.error(
-                        f"❌ ЛОЖНОЕ СРАБАТЫВАНИЕ: Предсказание в {pred['timestamp'].strftime('%H:%M:%S')} "
-                        f"на {pred['predicted_time'].strftime('%H:%M:%S')}"
-                    )
+            # Инициализируем поле если его нет
+            if 'is_confirmed' not in pred:
+                pred['is_confirmed'] = None
+
+            # Преобразуем строку времени обратно в datetime
+            try:
+                pred_timestamp = datetime.fromisoformat(pred['timestamp'])
+                predicted_time = pred_timestamp + timedelta(seconds=pred['lead_time_sec'])
+            except Exception as e:
+                self.logger.error(f"Ошибка обработки времени: {str(e)}")
+                continue
+
+            # Вычисляем разницу с событием
+            time_diff = (event_time - predicted_time).total_seconds()
+
+            # Проверка условий
+            if abs(time_diff) <= 2:
+                pred['is_confirmed'] = True
+                self.confirmed_predictions.append(pred)
+                self.logger.warning(
+                    f"✅ ПОДТВЕРЖДЕНО: Предсказание за {pred['lead_time_sec']} сек "
+                    f"(объявлено {pred_timestamp.strftime('%H:%M:%S')})"
+                )
+            elif event_time > predicted_time:
+                pred['is_confirmed'] = False
+                self.false_predictions.append(pred)
+                self.logger.error(
+                    f"❌ ЛОЖНОЕ: Предсказание {pred_timestamp.strftime('%H:%M:%S')} "
+                    f"ожидало событие к {predicted_time.strftime('%H:%M:%S')}"
+                )
 
     def log_best_prediction(self):
         if self.confirmed_predictions:
@@ -191,17 +255,30 @@ class PredictionLogger:
 
     def print_current_status(self):
         current_time = datetime.now()
-        active = [p for p in self.predictions
-                  if p['confirmed'] is None and p['predicted_time'] > current_time]
+
+        # Исправляем название ключа и преобразуем строку времени
+        active = [
+            p for p in self.predictions
+            if p.get('is_confirmed') is None
+               and datetime.strptime(p['predicted_time'], '%H:%M:%S').replace(year=current_time.year,
+                                                                              month=current_time.month,
+                                                                              day=current_time.day) > current_time
+        ]
 
         self.logger.info("\n=== ТЕКУЩИЙ СТАТУС ПРЕДСКАЗАНИЙ ===")
 
         if active:
             self.logger.info("Активные предсказания:")
-            for pred in sorted(active, key=lambda x: x['lead_time'], reverse=True):
-                sec_left = (pred['predicted_time'] - current_time).total_seconds()
+            for pred in sorted(active, key=lambda x: x['lead_time_sec'], reverse=True):
+                # Получаем объект datetime из строки
+                predicted_time = datetime.strptime(pred['predicted_time'], '%H:%M:%S').replace(
+                    year=current_time.year,
+                    month=current_time.month,
+                    day=current_time.day
+                )
+                sec_left = (predicted_time - current_time).total_seconds()
                 self.logger.info(
-                    f"• Через {sec_left:.1f} сек (запас времени {pred['lead_time']} сек, "
+                    f"• Через {sec_left:.1f} сек (запас времени {pred['lead_time_sec']} сек, "
                     f"уверенность {pred['confidence']:.1%})"
                 )
         else:
@@ -272,7 +349,7 @@ model = joblib.load('random_forestFULLDATASET11sd102min.pkl')
 scaler = joblib.load('scalerFULLDATASET11sd102min.pkl')
 
 
-async def model_worker(queue: asyncio.Queue):
+async def model_worker(queue: asyncio.Queue, collector: DataCollector):
     logger.info("Запуск обработчика предсказаний")
     buffer = deque(maxlen=150)
     prediction_logger = PredictionLogger()
@@ -282,8 +359,10 @@ async def model_worker(queue: asyncio.Queue):
     CLASS_TAGS = {600: 0, 601: 0, 602: 1}
     ALL_TAGS = NUMERIC_TAGS + list(CLASS_TAGS.keys())
     ALL_PREDICTIONS_FILE = 'all_predictions.json'
+    ##########iteration_counter = 0
     try:
         while True:
+            ##########iteration_counter += 1
             item = await queue.get()
             current_time = None
 
@@ -347,67 +426,87 @@ async def model_worker(queue: asyncio.Queue):
                 current_time = processed_df['source_time'].iloc[-1]
 
                 try:
-                    # Подготовка данных для модели
+                    # === Выполнение предсказаний ===
+                    current_time = processed_df['source_time'].iloc[-1]
+
+                    # Всегда выполняем предсказания
                     prediction_df = prepare_prediction_steps(processed_df, steps=10)
 
-                    # Обработка NaN
                     if prediction_df.isnull().any().any():
                         logger.warning("Обнаружены NaN в признаках - замена средними значениями")
                         prediction_df = prediction_df.fillna(prediction_df.mean())
 
-                    # Масштабирование и предсказание
                     scaled = scaler.transform(prediction_df)
                     predictions = model.predict(scaled)
                     prediction_probas = model.predict_proba(scaled)
 
-                    # === Логирование предсказаний ===
-                    emergency_detected = False
-                    for i, (pred, proba) in enumerate(zip(predictions, prediction_probas)):
-                        if pred == 1:  # Только аварийные предсказания
-                            lead_time = 10 - i  # 10, 9, ..., 1 секунд
-                            confidence = proba[1]
+                    # Имитация предсказания на каждой 5-й итерации
+                    ##########if iteration_counter % 5 == 0:
+                    ##########    logger.warning("!!! ТЕСТОВОЕ ПРЕДСКАЗАНИЕ АВАРИИ !!!")
+                    ##########    predictions = np.array([1] * 10)  # Все 10 шагов предсказывают аварию
+                    ##########    prediction_probas = np.array([[0.0, 1.0]] * 10)  # 100% уверенность в аварии
+                    # === Определение наличия аварийных предсказаний ===
+                    has_emergency_prediction = any(predictions)
 
-                            prediction_logger.add_prediction(
-                                timestamp=current_time,
-                                lead_time=lead_time,
-                                confidence=confidence,
-                                emergency_detected=True)
-                    # Сохраняем только если была хоть одна авария
-                    if emergency_detected:
+                    # === Логирование только при наличии предсказаний аварии ===
+                    if has_emergency_prediction:
+                        emergency_detected = False
+                        for i, (pred, proba) in enumerate(zip(predictions, prediction_probas)):
+                            if pred == 1:
+                                lead_time = 10 - i
+                                confidence = proba[1]
+
+                                prediction_logger.add_prediction(
+                                    timestamp=current_time,
+                                    lead_time=lead_time,
+                                    confidence=confidence,
+                                    emergency_detected=True
+                                )
+                                emergency_detected = True
+
+                        if emergency_detected:
                             prediction_logger.save_history(ALL_PREDICTIONS_FILE)
-                    # === Проверка на аварийные события ===
-                    is_emergency = True
+
+                    # === Проверка на РЕАЛЬНЫЕ аварийные события ===
+                    is_emergency = (
+                            processed_df['value_600'].iloc[-1] == 1 or
+                            processed_df['value_601'].iloc[-1] == 1
+                    )
 
                     if is_emergency:
+                        collector.add_real_emergency()  # <-- Добавляем реальную аварию
                         logger.warning(f"!!! АВАРИЯ ОБНАРУЖЕНА В {current_time.strftime('%H:%M:%S')} !!!")
                         prediction_logger.check_predictions(current_time)
                         prediction_logger.log_best_prediction()
                         prediction_logger.save_history('emergency_predictions.json')
 
-                    # === Периодический вывод статуса ===
+                    # === Логирование только при наличии предсказаний аварии ===
+                    if has_emergency_prediction:
+                        collector.add_predicted_emergency()  # <-- Добавляем предсказанную аварию
+                        emergency_detected = False
+
+                    # === Периодический вывод статуса (даже без аварий) ===
                     if len(buffer) % 50 == 0:
                         prediction_logger.print_current_status()
                         prediction_logger.save_history('predictions_history.json')
 
                     # === Визуализация результатов ===
-                    # В разделе визуализации результатов замените вывод таблицы на:
-                    if is_emergency or (len(buffer) % 20 == 0):
-                        print("\n" + "=" * 80)
-                        print(f"Последние предсказания ({current_time.strftime('%H:%M:%S')}):")
+                    # Вывод таблицы предсказаний ВСЕГДА
+                    print("\n" + "=" * 80)
+                    print(f"Последние предсказания ({current_time.strftime('%H:%M:%S')}):")
 
-                        display_data = {
-                            'Шаг': range(10, 0, -1),
-                            'Прогноз аварии': ['Да' if p == 1 else 'Нет' for p in predictions],
-                            'Уверенность (норма)': [f"{p[0]:.2%}" for p in prediction_probas],
-                            'Уверенность (авария)': [f"{p[1]:.2%}" for p in prediction_probas]
-                        }
+                    display_data = {
+                        'Шаг': range(10, 0, -1),
+                        'Прогноз аварии': ['Да' if p == 1 else 'Нет' for p in predictions],
+                        'Уверенность (норма)': [f"{p[0]:.2%}" for p in prediction_probas],
+                        'Уверенность (авария)': [f"{p[1]:.2%}" for p in prediction_probas]
+                    }
 
-                        display_df = pd.DataFrame(display_data)
+                    display_df = pd.DataFrame(display_data)
+                    print(display_df.to_string(index=False, justify='center'))
+                    print("=" * 80 + "\n")
 
-                        print(display_df.to_string(index=False, justify='center'))
-                        print("=" * 80 + "\n")
-
-                    # Вывод последних 10 строк
+                    # Вывод последних 10 строк данных ВСЕГДА
                     output_df = processed_df.tail(10).copy()
                     output_df['source_time'] = output_df['source_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -415,6 +514,10 @@ async def model_worker(queue: asyncio.Queue):
                     print(f"Последние показания (10 из {len(processed_df)} записей):")
                     print(output_df.fillna('N/A').to_string(index=False))
                     print("=" * 100 + "\n")
+
+                    # Сохраняем в JSON ТОЛЬКО при наличии аварийных предсказаний
+                    if has_emergency_prediction:
+                        prediction_logger.save_history(ALL_PREDICTIONS_FILE)
                 except Exception as model_error:
                     logger.error(f"Ошибка модели: {str(model_error)}", exc_info=True)
 
@@ -484,7 +587,7 @@ async def main():
 
     # Подготовка 2х потоков для обработки данных
     logger.info("Запуск потоков для обработки данных")
-    workers = [asyncio.create_task(model_worker(collector.queue))]
+    workers = [asyncio.create_task(model_worker(collector.queue, collector))]
     #workers = [asyncio.create_task(model_worker(collector.queue)) for _ in range(2)]
     # запуск потоков
     await asyncio.gather(*workers)
