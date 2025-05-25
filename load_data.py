@@ -113,7 +113,7 @@ class DataCollector:
         try:
             while self.collecting:
                 data = await self.db.fetch_multiple_tags(DATA_TAGS, timestamp)
-                'timestamped': {
+                timestamped = {
                     'collected_at': datetime.now(datetime.UTC).isoformat(),
                     'data': data
                 }
